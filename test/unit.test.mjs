@@ -27,6 +27,17 @@ describe("wire", () => {
     expect(wire.cborDecode(Uint8Array.from([0xfb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0]))).toBe(1.5)
   })
 
+  test("CBOR decodes indefinite-length arrays, maps and strings", () => {
+    expect(wire.cborDecode(Buffer.from("9f01bf616102ffff", "hex"))).toEqual([1, { a: 2 }])
+    expect(wire.cborDecode(Buffer.from("7f626865636c6c6fff", "hex"))).toBe("hello")
+    expect(wire.cborDecode(Buffer.from("5f4101420203ff", "hex"))).toEqual(new Uint8Array([1, 2, 3]))
+  })
+
+  test("CBOR rejects truncated indefinite items and invalid string chunks", () => {
+    expect(() => wire.cborDecode(Buffer.from("bf616101", "hex"))).toThrow("truncated CBOR")
+    expect(() => wire.cborDecode(Buffer.from("5f6161ff", "hex"))).toThrow("invalid CBOR string chunk")
+  })
+
   test("AIDP inbound and outbound", () => {
     const out = JSON.parse(new TextDecoder().decode(wire.aidpEncode('{"type":"ping"}')))
     expect(out.eventType).toBe("rawInputEvent")
@@ -40,6 +51,25 @@ describe("wire", () => {
 
   test("Gateway round trip", () => {
     expect(wire.gatewayDecode(wire.gatewayEncode('{"type":"session_connect"}'))).toEqual(['{"type":"session_connect"}'])
+  })
+
+  test("Gateway decodes a response in an indefinite-length CBOR map", () => {
+    const reply = '{"type":"text_delta","payload":{"delta":"OK"}}'
+    const envelope = Uint8Array.from([
+      0xbf,
+      ...wire.cborEncode("payload"),
+      ...wire.cborEncode(new TextEncoder().encode(reply)),
+      0xff,
+    ])
+    const frame = wire.eventStreamEncode(
+      { ":message-type": "event", ":event-type": "rawOutputEvent", ":content-type": "application/cbor" },
+      envelope,
+    )
+    const initial = wire.eventStreamEncode(
+      { ":message-type": "event", ":event-type": "initial-response", ":content-type": "application/cbor" },
+      Uint8Array.from([0xbf, 0xff]),
+    )
+    expect(wire.gatewayDecode(Buffer.concat([initial, frame]))).toEqual([reply])
   })
 })
 

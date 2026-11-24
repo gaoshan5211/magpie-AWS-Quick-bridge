@@ -226,12 +226,36 @@ function halfToFloat(h) {
   return sign * 2 ** (exp - 15) * (1 + frac / 1024)
 }
 
+const CBOR_BREAK = 0xff
+
+function cborDecodeChunkedString(data, view, start, major) {
+  const chunks = []
+  let position = start
+  while (data[position] !== CBOR_BREAK) {
+    if (position >= data.length) throw new Error("truncated CBOR")
+    const head = data[position]
+    if (head >> 5 !== major || (head & 0x1f) === 31) throw new Error("invalid CBOR string chunk")
+    const [chunk, next] = cborDecodeAt(data, view, position)
+    chunks.push(chunk)
+    position = next
+  }
+  if (major === 3) return [chunks.join(""), position + 1]
+  const bytes = new Uint8Array(chunks.reduce((length, chunk) => length + chunk.byteLength, 0))
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return [bytes, position + 1]
+}
+
 function cborDecodeAt(data, view, start) {
   let i = start
   if (i >= data.length) throw new Error("truncated CBOR")
   const initial = data[i++]
   const major = initial >> 5
   const info = initial & 0x1f
+  const indefinite = info === 31
   const need = (n) => {
     if (i + n > data.length) throw new Error("truncated CBOR")
   }
@@ -253,7 +277,9 @@ function cborDecodeAt(data, view, start) {
     need(8)
     n = Number(view.getBigUint64(i))
     i += 8
-  } else if (info >= 28) throw new Error(`unsupported CBOR additional info ${info}`)
+  } else if (info >= 28 && !(indefinite && major >= 2 && major <= 5)) {
+    throw new Error(`unsupported CBOR additional info ${info}`)
+  }
 
   switch (major) {
     case 0:
@@ -261,29 +287,31 @@ function cborDecodeAt(data, view, start) {
     case 1:
       return [-1 - n, i]
     case 2:
+      if (indefinite) return cborDecodeChunkedString(data, view, i, major)
       need(n)
       return [data.slice(i, i + n), i + n]
     case 3:
+      if (indefinite) return cborDecodeChunkedString(data, view, i, major)
       need(n)
       return [decoder.decode(data.subarray(i, i + n)), i + n]
     case 4: {
       const arr = []
-      for (let k = 0; k < n; k++) {
+      for (let k = 0; indefinite ? data[i] !== CBOR_BREAK : k < n; k++) {
         const [item, next] = cborDecodeAt(data, view, i)
         arr.push(item)
         i = next
       }
-      return [arr, i]
+      return [arr, indefinite ? i + 1 : i]
     }
     case 5: {
       const map = {}
-      for (let k = 0; k < n; k++) {
+      for (let k = 0; indefinite ? data[i] !== CBOR_BREAK : k < n; k++) {
         const [key, afterKey] = cborDecodeAt(data, view, i)
         const [val, afterVal] = cborDecodeAt(data, view, afterKey)
         map[key instanceof Uint8Array ? decoder.decode(key) : String(key)] = val
         i = afterVal
       }
-      return [map, i]
+      return [map, indefinite ? i + 1 : i]
     }
     case 6:
       // Tag: decode the tagged value and ignore the tag itself.
@@ -381,9 +409,10 @@ export function gatewayDecode(data) {
     throw new Error(`decode gateway event-stream: ${e.message}`)
   }
   if (!messages.length) throw new Error("decode gateway event-stream: no complete frame")
-  return messages.map((msg) => {
+  return messages.flatMap((msg) => {
     const err = frameError(msg.headers)
     if (err) throw err
+    if (headerString(msg.headers, ":event-type") === "initial-response") return []
     let value
     try {
       value = cborDecode(msg.payload)
@@ -391,8 +420,8 @@ export function gatewayDecode(data) {
       throw new Error(`decode gateway CBOR: ${e.message}`)
     }
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("gateway CBOR is not a map")
-    if (value.payload instanceof Uint8Array) return decoder.decode(value.payload)
-    if (typeof value.payload === "string") return value.payload
+    if (value.payload instanceof Uint8Array) return [decoder.decode(value.payload)]
+    if (typeof value.payload === "string") return [value.payload]
     throw new Error("gateway CBOR has no payload")
   })
 }
